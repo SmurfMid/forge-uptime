@@ -3,7 +3,7 @@
 name: forge-public-probe
 on:
   schedule:
-    - cron: "7,22,37,52 * * * *"   # every 15 min; GitHub may delay or skip scheduled runs under load (counted as a gap)
+    - cron: "5,20,35,50 * * * *"   # every 15 min; GitHub may delay or skip scheduled runs under load (counted as a gap)
   workflow_dispatch: {}
 permissions:
   contents: write
