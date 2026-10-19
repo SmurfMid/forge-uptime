@@ -1,35 +1,54 @@
-# Forge public uptime probe. Public URLs only; no secrets. Uses only the built-in GITHUB_TOKEN to append one JSONL line per run
-# to the branch "status" (file forge-public-probe.jsonl), so the 7-day pass rule can read the full run history.
+# Forge public uptime probe. Public URLs only; no secrets. Uses only the built-in GITHUB_TOKEN.
+# Self-chaining: GitHub's cron has not fired once on this repo, so each dispatched run probes every 15 min for ~5h45m,
+# then dispatches its own successor (GITHUB_TOKEN may trigger workflow_dispatch; docs: "Triggering a workflow from a workflow").
+# Public repo, so the minutes are free. The cron stays as a second trigger; any gap still counts against the 7-day rule.
 name: forge-public-probe
 on:
   schedule:
-    - cron: "5,20,35,50 * * * *"   # every 15 min; GitHub may delay or skip scheduled runs under load (counted as a gap)
-  workflow_dispatch: {}
+    - cron: "5,20,35,50 * * * *"
+  workflow_dispatch:
+    inputs:
+      chain:
+        description: "probe every 15 min for ~5h45m, then dispatch the next run"
+        type: boolean
+        default: false
 permissions:
   contents: write
-concurrency: { group: forge-public-probe, cancel-in-progress: false }
+  actions: write
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: ${{ inputs.chain && 355 || 5 }}
+    concurrency: { group: "forge-public-probe-${{ inputs.chain && 'chain' || 'single' }}", cancel-in-progress: false }
     steps:
       - uses: actions/checkout@v4
-      - name: public checks
-        id: p
-        run: |
-          python3 tools/forge_public_probe.py --jsonl /tmp/row.jsonl || echo "fail=1" >> "$GITHUB_OUTPUT"
-          { echo '### forge-public-probe'; echo '```'; cat /tmp/row.jsonl; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-      - name: append to status branch
+      - name: probe (once, or every 15 min for 23 rounds when chained)
+        env: { CHAIN: "${{ inputs.chain && '1' || '0' }}" }
         run: |
           git config user.name forge-public-probe
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          for i in 1 2 3; do
-            if git fetch -q origin status 2>/dev/null; then git checkout -q -B status origin/status; else git checkout -q --orphan status && git rm -rq --cached . && git clean -fdq; fi
-            cat /tmp/row.jsonl >> forge-public-probe.jsonl
-            git add forge-public-probe.jsonl
-            git commit -qm "probe $(date -u +%FT%TZ)" && git push -q origin status && break
-            git checkout -q main 2>/dev/null; git reset -q --hard; sleep 5
+          cp tools/forge_public_probe.py /tmp/probe.py
+          rounds=1; [ "$CHAIN" = 1 ] && rounds=23
+          fails=0
+          for r in $(seq 1 $rounds); do
+            start=$(date +%s)
+            python3 /tmp/probe.py --jsonl /tmp/row.jsonl || fails=$((fails+1))
+            { echo "### round $r"; echo '```'; cat /tmp/row.jsonl; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            for i in 1 2 3; do
+              if git fetch -q origin status 2>/dev/null; then git checkout -q -B status origin/status; else git checkout -q --orphan status && git rm -rq --cached . && git clean -fdq; fi
+              cat /tmp/row.jsonl >> forge-public-probe.jsonl
+              git add forge-public-probe.jsonl
+              git commit -qm "probe $(date -u +%FT%TZ)" && git push -q origin status && break
+              git reset -q --hard; sleep 5
+            done
+            rm -f /tmp/row.jsonl
+            if [ "$r" -lt "$rounds" ]; then w=$(( 900 - ($(date +%s) - start) )); if [ "$w" -gt 0 ]; then sleep "$w"; fi; fi
           done
-      - name: fail the run if a check failed
-        if: steps.p.outputs.fail == '1'
+          echo "fails=$fails" >> "$GITHUB_ENV"
+      - name: dispatch the next chained run
+        if: ${{ always() && inputs.chain }}
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: gh workflow run forge-public-probe.yml -R "$GITHUB_REPOSITORY" --ref main -f chain=true
+      - name: fail the run if any check failed
+        if: ${{ env.fails != '0' }}
         run: exit 1
