@@ -1,0 +1,35 @@
+# Forge public uptime probe. Public URLs only; no secrets. Uses only the built-in GITHUB_TOKEN to append one JSONL line per run
+# to the branch "status" (file forge-public-probe.jsonl), so the 7-day pass rule can read the full run history.
+name: forge-public-probe
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"   # every 15 min; GitHub may delay or skip scheduled runs under load (counted as a gap)
+  workflow_dispatch: {}
+permissions:
+  contents: write
+concurrency: { group: forge-public-probe, cancel-in-progress: false }
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: public checks
+        id: p
+        run: |
+          python3 tools/forge_public_probe.py --jsonl /tmp/row.jsonl || echo "fail=1" >> "$GITHUB_OUTPUT"
+          { echo '### forge-public-probe'; echo '```'; cat /tmp/row.jsonl; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: append to status branch
+        run: |
+          git config user.name forge-public-probe
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          for i in 1 2 3; do
+            if git fetch -q origin status 2>/dev/null; then git checkout -q -B status origin/status; else git checkout -q --orphan status && git rm -rq --cached . && git clean -fdq; fi
+            cat /tmp/row.jsonl >> forge-public-probe.jsonl
+            git add forge-public-probe.jsonl
+            git commit -qm "probe $(date -u +%FT%TZ)" && git push -q origin status && break
+            git checkout -q main 2>/dev/null; git reset -q --hard; sleep 5
+          done
+      - name: fail the run if a check failed
+        if: steps.p.outputs.fail == '1'
+        run: exit 1
